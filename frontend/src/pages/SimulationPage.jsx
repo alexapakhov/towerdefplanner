@@ -177,8 +177,11 @@ export default function SimulationPage() {
   const speedRef    = useRef(1)
   speedRef.current  = speed
 
-  // Track currency in a ref for sync access inside RAF loop
-  const currencyRef = useRef(0)
+  // Track currency + playerBuilt in refs for sync access inside RAF loop / callbacks
+  const currencyRef    = useRef(0)
+  const playerBuiltRef = useRef({})
+  // Flag: when true, next resetSim call preserves currency+towers (wave advance)
+  const preserveProgressRef = useRef(false)
 
   // Load all data
   useEffect(() => {
@@ -196,6 +199,8 @@ export default function SimulationPage() {
         setPlayerCurrency(startCurr)
         currencyRef.current = startCurr
         setPlayerBuilt({})
+        playerBuiltRef.current = {}
+        preserveProgressRef.current = false
         setLoading(false)
       }
     }
@@ -224,6 +229,9 @@ export default function SimulationPage() {
   }, [data])
 
   const waveNumber = data?.waves[selectedWave]?.wave_number ?? 1
+
+  // Keep playerBuiltRef in sync for use inside callbacks/resetSim
+  useEffect(() => { playerBuiltRef.current = playerBuilt }, [playerBuilt])
 
   const zoneBlockers = useMemo(() => {
     try { return JSON.parse(data?.level?.zone_blockers || '[]') } catch { return [] }
@@ -256,17 +264,45 @@ export default function SimulationPage() {
   const spawnerDist     = spawnerInfo?.pathDist ?? 0
   const playerAnchorDist = Math.min(pathLen - 10, spawnerDist + 40)
 
-  // ── Reset ──────────────────────────────────────────────────────────────────
-  const resetSim = useCallback(() => {
+  // ── initWave: set up sim loop for current selectedWave ────────────────────
+  // If preserveProgressRef.current=true: keep currency+towers (wave advance)
+  // Otherwise: full reset (new game)
+  const initWave = useCallback((waveIdx) => {
     if (!data) return
-    const wave = data.waves[selectedWave]
+    const wave = data.waves[waveIdx ?? selectedWave]
     if (!wave) return
     const sq = data.squad
-    const startCurr = data.level.starting_currency || 0
-    currencyRef.current = startCurr
-    setPlayerCurrency(startCurr)
-    setPlayerBuilt({})
-    setSelectedSlotId(null)
+
+    const preserve = preserveProgressRef.current
+    preserveProgressRef.current = false
+
+    if (!preserve) {
+      const startCurr = data.level.starting_currency || 0
+      currencyRef.current = startCurr
+      setPlayerCurrency(startCurr)
+      setPlayerBuilt({})
+      playerBuiltRef.current = {}
+      setSelectedSlotId(null)
+      setRaidWon(false)
+    }
+
+    const newWaveNumber = wave.wave_number
+    const availIds = new Set(towerSlots.filter(s => slotUnlockWave(s) < newWaveNumber).map(s => s.id))
+
+    // Rebuild active towers from current playerBuilt (for preserve) or empty (fresh start)
+    const pb = preserve ? playerBuiltRef.current : {}
+    const activeTws = Object.entries(pb).map(([slotId, { towerTypeId, upgradeLevel }]) => {
+      const slot = towerSlots.find(s => s.id === slotId)
+      const tt = towerTypesMap[towerTypeId]
+      if (!slot || !tt) return null
+      return buildTowerObj(slot, tt, upgradeLevel, newWaveNumber, availIds)
+    }).filter(t => t?.active)
+
+    // Compute spawner for this wave
+    const zbList = (() => { try { return JSON.parse(data.level.zone_blockers || '[]') } catch { return [] } })()
+    const spInfo = getActiveSpawner(zbList, newWaveNumber, pathNodes)
+    const spDist = spInfo?.pathDist ?? 0
+    const plAnchor = Math.min(pathLen - 10, spDist + 40)
 
     simRef.current = {
       time: 0,
@@ -279,12 +315,12 @@ export default function SimulationPage() {
       transportHp: data.level.transport_hp,
       transportMaxHp: data.level.transport_hp,
       kills: 0,
-      currency: startCurr,
-      activeTowers: [],   // starts empty — player builds
-      towerCooldowns: {},
-      spawnerDist,
-      playerDist: playerAnchorDist,
-      playerAnchorDist,
+      currency: currencyRef.current,
+      activeTowers: activeTws,
+      towerCooldowns: Object.fromEntries(activeTws.map(t => [t.id, Math.random() * FIRE_COOLDOWN])),
+      spawnerDist: spDist,
+      playerDist: plAnchor,
+      playerAnchorDist: plAnchor,
       playerCooldown: 0,
       companionOffsets: Array.from({ length: sq?.companion_count || 4 }, (_, i) => (i % 2 === 0 ? -1 : 1) * (15 + i * 10)),
       squad: sq,
@@ -293,13 +329,42 @@ export default function SimulationPage() {
     setStatKills(0)
     setStatElapsed(0)
     setStatPhase('waiting')
-    setRaidWon(false)
-  }, [data, selectedWave, enemyMap, spawnerDist, playerAnchorDist])
+  }, [data, selectedWave, enemyMap, towerSlots, towerTypesMap, pathNodes, pathLen])
 
+  // Re-init when wave index or data changes
   useEffect(() => {
-    resetSim()
+    initWave()
     setRunning(false)
-  }, [resetSim])
+  }, [initWave])
+
+  // ── Full reset: back to wave 1, clear currency+towers ─────────────────────
+  const handleFullReset = useCallback(() => {
+    setRunning(false)
+    preserveProgressRef.current = false
+    if (selectedWave === 0) {
+      // Same wave — initWave won't re-run from effect, call explicitly
+      const startCurr = data?.level?.starting_currency || 0
+      currencyRef.current = startCurr
+      setPlayerCurrency(startCurr)
+      setPlayerBuilt({})
+      playerBuiltRef.current = {}
+      setSelectedSlotId(null)
+      setRaidWon(false)
+      initWave(0)
+    } else {
+      setSelectedWave(0)  // triggers initWave via effect
+    }
+  }, [data, selectedWave, initWave])
+
+  // ── Advance to next wave keeping currency + towers ─────────────────────────
+  const handleNextWave = useCallback(() => {
+    const nextIdx = selectedWave + 1
+    if (!data?.waves[nextIdx]) return
+    preserveProgressRef.current = true
+    setRunning(false)
+    setSelectedWave(nextIdx)  // triggers initWave via effect with preserve=true
+    setTimeout(() => setRunning(true), 80)
+  }, [data, selectedWave])
 
   // ── Build / Upgrade / Sell ─────────────────────────────────────────────────
   const handleBuild = useCallback((slotId, towerTypeId) => {
@@ -720,23 +785,44 @@ export default function SimulationPage() {
 
         {/* Controls */}
         <div className="flex gap-1.5 flex-shrink-0">
-          <button
-            onClick={() => {
-              if (statPhase === 'done' || statPhase === 'idle') {
-                resetSim(); setTimeout(() => setRunning(true), 30)
-              } else {
-                setRunning(r => !r)
-              }
-            }}
-            className={`px-4 py-1.5 rounded-xl text-sm font-semibold transition-all flex-shrink-0 ${
-              running ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-orange-500 hover:bg-orange-600 text-white shadow-lg shadow-orange-500/20'
-            }`}
-          >
-            {running ? '⏸ Pause' : statPhase === 'done' ? '↺ Replay' : '▶ Play'}
-          </button>
-          <button onClick={() => { setRunning(false); resetSim() }}
-            className="px-3 py-1.5 rounded-xl text-sm bg-gray-800 text-gray-400 hover:bg-gray-700 transition-colors border border-gray-700 flex-shrink-0"
-            title="Full reset">
+          {/* Next Wave — only visible when wave is done AND next wave exists */}
+          {statPhase === 'done' && data.waves[selectedWave + 1] && !raidWon && (
+            <button onClick={handleNextWave}
+              className="px-4 py-1.5 rounded-xl text-sm font-semibold bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-500/20 transition-all flex-shrink-0 animate-pulse">
+              Next Wave →
+            </button>
+          )}
+
+          {/* Play / Pause / Replay this wave */}
+          {!(statPhase === 'done' && data.waves[selectedWave + 1] && !raidWon) && (
+            <button
+              onClick={() => {
+                if (statPhase === 'done' || statPhase === 'idle') {
+                  initWave(); setTimeout(() => setRunning(true), 30)
+                } else {
+                  setRunning(r => !r)
+                }
+              }}
+              className={`px-4 py-1.5 rounded-xl text-sm font-semibold transition-all flex-shrink-0 ${
+                running ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-orange-500 hover:bg-orange-600 text-white shadow-lg shadow-orange-500/20'
+              }`}
+            >
+              {running ? '⏸ Pause' : statPhase === 'done' ? '↺ Replay' : '▶ Play'}
+            </button>
+          )}
+
+          {/* Pause during run */}
+          {running && (
+            <button onClick={() => setRunning(false)}
+              className="px-3 py-1.5 rounded-xl text-sm bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors border border-gray-700 flex-shrink-0">
+              ⏸
+            </button>
+          )}
+
+          {/* Full reset — back to wave 1, clear all */}
+          <button onClick={handleFullReset}
+            className="px-3 py-1.5 rounded-xl text-sm bg-gray-800 text-gray-500 hover:bg-red-900/40 hover:text-red-400 transition-colors border border-gray-700 flex-shrink-0"
+            title="Full reset — back to wave 1">
             ↺
           </button>
         </div>
@@ -1174,9 +1260,17 @@ export default function SimulationPage() {
 
           {/* Wave info */}
           {data.waves[selectedWave] && (
-            <div className="bg-[#161b22] border border-gray-800/80 rounded-xl p-3">
+            <div className={`bg-[#161b22] border rounded-xl p-3 ${statPhase === 'done' && data.waves[selectedWave + 1] && !raidWon ? 'border-green-600/50' : 'border-gray-800/80'}`}>
+              {/* Wave progress dots */}
+              <div className="flex items-center gap-1 mb-2">
+                {data.waves.map((w, i) => (
+                  <div key={i} className={`h-1.5 flex-1 rounded-full ${
+                    i < selectedWave ? 'bg-green-600' : i === selectedWave ? 'bg-orange-500' : 'bg-gray-700'
+                  }`} />
+                ))}
+              </div>
               <p className="text-[9px] text-gray-600 uppercase tracking-widest mb-2 font-bold">
-                Wave {data.waves[selectedWave].wave_number}
+                Wave {data.waves[selectedWave].wave_number} / {data.waves.length}
               </p>
               <div className="space-y-1 text-[11px]">
                 <div className="flex justify-between">
@@ -1202,6 +1296,13 @@ export default function SimulationPage() {
                   </div>
                   <p className="text-[9px] text-gray-600 mt-1 text-right">{Math.round((statKills / spawnTotal) * 100)}% killed</p>
                 </div>
+              )}
+              {/* Next wave prompt */}
+              {statPhase === 'done' && data.waves[selectedWave + 1] && !raidWon && (
+                <button onClick={handleNextWave}
+                  className="mt-3 w-full py-2 rounded-xl text-xs font-bold bg-green-600/20 border border-green-600/40 text-green-400 hover:bg-green-600/30 transition-all">
+                  Next Wave {data.waves[selectedWave + 1].wave_number} →
+                </button>
               )}
             </div>
           )}
