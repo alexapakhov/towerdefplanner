@@ -31,7 +31,6 @@ function pointAtDist(d, nodes) {
   return nodes[nodes.length - 1]
 }
 
-// Cumulative path distance to a given node index
 function pathDistAtNode(nodeIdx, nodes) {
   let dist = 0
   for (let i = 0; i < Math.min(nodeIdx, nodes.length - 1); i++) {
@@ -40,20 +39,11 @@ function pathDistAtNode(nodeIdx, nodes) {
   return dist
 }
 
-// Given zone blockers and current waveNumber, find the active spawner:
-// = the locked ZB with the LOWEST unlock_after_wave (nearest to transport/player).
-// Zone blockers are ordered so that the one closest to the transport unlocks first.
-// As it opens, spawner moves to the next ZB further from transport.
-// Returns { pathDist, blocker } or null if all open → spawn from path start.
 function getActiveSpawner(zoneBlockers, waveNumber, pathNodes) {
-  // Locked ZBs for this wave
   const locked = zoneBlockers.filter(b => b.unlock_after_wave >= waveNumber)
-  if (!locked.length) return null  // all open — spawn from start
-
-  // The one that unlocks first (lowest wave) is nearest to transport/player
+  if (!locked.length) return null
   locked.sort((a, b) => a.unlock_after_wave - b.unlock_after_wave)
   const active = locked[0]
-
   const nodeIdx = active.node_index ?? 0
   const dist = pathDistAtNode(nodeIdx, pathNodes)
   return { blocker: active, pathDist: dist, pos: pathNodes[nodeIdx] || pointAtDist(dist, pathNodes) }
@@ -61,9 +51,11 @@ function getActiveSpawner(zoneBlockers, waveNumber, pathNodes) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const EFFECT_COLORS = { Shell: '#f97316', Electro: '#a78bfa', Ice: '#38bdf8', Fire: '#ef4444', None: '#22c55e' }
-const ENEMY_SIZE_R = { Small: 7, Medium: 10, Large: 14 }
-const FIRE_COOLDOWN = 0.4   // seconds between shots (visual pacing)
+const ENEMY_SIZE_R  = { Small: 7, Medium: 10, Large: 14 }
+const FIRE_COOLDOWN = 0.4
 const SQUAD_COOLDOWN = 0.5
+// [build, lv0→1, lv1→2, lv2→3]  cost = base_cost * mult
+const UPGRADE_COST_MULTS = [1, 0.6, 1.0, 1.8]
 
 let _eid = 0
 
@@ -84,6 +76,7 @@ function makeEnemy(et, startDist) {
     alive: true,
     dying: false,
     dyingTimer: 0,
+    currencyDrop: et.currency_drop || 0,
   }
 }
 
@@ -104,50 +97,53 @@ function buildSpawnQueue(wave, enemyMap) {
   return queue.sort((a, b) => a.time - b.time)
 }
 
-// Normalize slot unlock field — editor saves as unlock_after_wave OR unlock_wave
 function slotUnlockWave(s) {
   return s.unlock_after_wave ?? s.unlock_wave ?? 0
 }
 
-// waveNumber: the wave being simulated (1-based)
-// Slots with unlock_after_wave < waveNumber are available for this wave
-function buildTowers(placements, towerTypesMap, slots, waveNumber) {
+// Build a single tower object from slot + towerType
+function buildTowerObj(slot, tt, upgradeLevel, waveNumber, availableSlotIds) {
+  const upgLevel = upgradeLevel || 0
+  let dpsMults, rangeMults
+  try { dpsMults = JSON.parse(tt.upgrade_dps_mults) } catch { dpsMults = [1, 1.6, 2.5, 4] }
+  try { rangeMults = JSON.parse(tt.upgrade_range_mults) } catch { rangeMults = [1, 1.15, 1.3, 1.5] }
+  return {
+    id: `${slot.id}_${tt.id}`,
+    slotId: slot.id,
+    x: slot.x,
+    y: slot.y,
+    unlockWave: slotUnlockWave(slot),
+    active: availableSlotIds.has(slot.id),
+    name: tt.name,
+    category: tt.category,
+    effectType: tt.effect_type,
+    dps: tt.base_dps * (dpsMults[upgLevel] ?? 1),
+    range: tt.base_range * (rangeMults[upgLevel] ?? 1),
+    color: tt.color || EFFECT_COLORS[tt.effect_type] || '#f97316',
+    slowFactor: tt.slow_factor || 0,
+    boostMult: tt.boost_mult || 1,
+    upgradeLevel: upgLevel,
+  }
+}
+
+// Build all towers from playerBuilt map {slotId: {towerTypeId, upgradeLevel}}
+function buildTowers(playerBuilt, towerTypesMap, slots, waveNumber) {
   const availableSlotIds = new Set(
     slots.filter(s => slotUnlockWave(s) < waveNumber).map(s => s.id)
   )
-  return placements.map(p => {
-    const slot = slots.find(s => s.id === p.slot_id)
-    const tt = towerTypesMap[p.tower_type_id]
+  return Object.entries(playerBuilt).map(([slotId, { towerTypeId, upgradeLevel }]) => {
+    const slot = slots.find(s => s.id === slotId)
+    const tt = towerTypesMap[towerTypeId]
     if (!slot || !tt) return null
-    const upgLevel = p.upgrade_level || 0
-    let dpsMults, rangeMults
-    try { dpsMults = JSON.parse(tt.upgrade_dps_mults) } catch { dpsMults = [1, 1.6, 2.5, 4] }
-    try { rangeMults = JSON.parse(tt.upgrade_range_mults) } catch { rangeMults = [1, 1.15, 1.3, 1.5] }
-    return {
-      id: String(p.id || Math.random()),
-      slotId: slot.id,
-      x: slot.x,
-      y: slot.y,
-      unlockWave: slotUnlockWave(slot),
-      active: availableSlotIds.has(slot.id),  // false = locked for this wave
-      name: tt.name,
-      category: tt.category,
-      effectType: tt.effect_type,
-      dps: tt.base_dps * (dpsMults[upgLevel] ?? 1),
-      range: tt.base_range * (rangeMults[upgLevel] ?? 1),
-      color: tt.color || EFFECT_COLORS[tt.effect_type] || '#f97316',
-      slowFactor: tt.slow_factor || 0,
-      boostMult: tt.boost_mult || 1,
-    }
+    return buildTowerObj(slot, tt, upgradeLevel, waveNumber, availableSlotIds)
   }).filter(Boolean)
 }
 
-// All slots including those without placements (to show locked empties)
-function buildAllSlots(slots, waveNumber) {
-  return slots.map(s => ({
-    ...s,
-    active: slotUnlockWave(s) < waveNumber,
-  }))
+// Tower upgrade cost
+function towerUpgradeCost(tt, fromLevel) {
+  let mults
+  try { mults = JSON.parse(tt.upgrade_costs) } catch { mults = UPGRADE_COST_MULTS }
+  return Math.round(tt.base_cost * (mults[fromLevel + 1] ?? 2))
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -155,25 +151,34 @@ export default function SimulationPage() {
   const { id } = useParams()
   const navigate = useNavigate()
 
-  const [loading, setLoading] = useState(true)
-  const [data, setData] = useState(null)
+  const [loading, setLoading]   = useState(true)
+  const [data, setData]         = useState(null)
   const [selectedWave, setSelectedWave] = useState(0)
-  const [speed, setSpeed] = useState(1)
-  const [running, setRunning] = useState(false)
-  const [tick, setTick] = useState(0)
+  const [speed, setSpeed]       = useState(1)
+  const [running, setRunning]   = useState(false)
+  const [tick, setTick]         = useState(0)
+
+  // ── Player game state ─────────────────────────────────────────────────────
+  // { slotId: { towerTypeId, upgradeLevel } }
+  const [playerBuilt, setPlayerBuilt]       = useState({})
+  const [playerCurrency, setPlayerCurrency] = useState(0)
+  const [selectedSlotId, setSelectedSlotId] = useState(null)
 
   // Stats synced from sim
   const [statTransportHp, setStatTransportHp] = useState(null)
-  const [statKills, setStatKills] = useState(0)
-  const [raidWon, setRaidWon] = useState(false)
+  const [statKills, setStatKills]   = useState(0)
+  const [raidWon, setRaidWon]       = useState(false)
   const [statElapsed, setStatElapsed] = useState(0)
-  const [statPhase, setStatPhase] = useState('idle')
+  const [statPhase, setStatPhase]   = useState('idle')
 
-  const simRef = useRef(null)
-  const rafRef = useRef(null)
-  const lastTsRef = useRef(null)
-  const speedRef = useRef(1)
-  speedRef.current = speed
+  const simRef      = useRef(null)
+  const rafRef      = useRef(null)
+  const lastTsRef   = useRef(null)
+  const speedRef    = useRef(1)
+  speedRef.current  = speed
+
+  // Track currency in a ref for sync access inside RAF loop
+  const currencyRef = useRef(0)
 
   // Load all data
   useEffect(() => {
@@ -187,6 +192,10 @@ export default function SimulationPage() {
       if (!cancelled) {
         setData({ level, waves, placements, squad, tts, ets })
         setStatTransportHp(level.transport_hp)
+        const startCurr = level.starting_currency || 0
+        setPlayerCurrency(startCurr)
+        currencyRef.current = startCurr
+        setPlayerBuilt({})
         setLoading(false)
       }
     }
@@ -220,34 +229,31 @@ export default function SimulationPage() {
     try { return JSON.parse(data?.level?.zone_blockers || '[]') } catch { return [] }
   }, [data])
 
-  // All towers (active + locked) for rendering; filtered to active-only for simulation
+  // Towers derived from player's choices (not from editor placements)
   const towers = useMemo(() => {
     if (!data) return []
-    return buildTowers(data.placements, towerTypesMap, towerSlots, waveNumber)
-  }, [data, towerTypesMap, towerSlots, waveNumber])
+    return buildTowers(playerBuilt, towerTypesMap, towerSlots, waveNumber)
+  }, [playerBuilt, towerTypesMap, towerSlots, waveNumber])
 
-  // Empty slots that have no placement (show as build spots)
   const allSlots = useMemo(() => {
     if (!data) return []
-    return buildAllSlots(towerSlots, waveNumber)
+    return towerSlots.map(s => ({
+      ...s,
+      active: slotUnlockWave(s) < waveNumber,
+    }))
   }, [towerSlots, waveNumber])
 
   const activeTowers = useMemo(() => towers.filter(t => t.active), [towers])
 
-  // Final ZB = the one with the highest unlock_after_wave (win target)
   const finalZbWave = zoneBlockers.length > 0
     ? Math.max(...zoneBlockers.map(b => b.unlock_after_wave))
     : null
 
-  // Active spawner: the nearest-to-transport locked ZB for this wave.
-  // null → all ZBs open, enemies spawn from path start (dist 0).
   const spawnerInfo = useMemo(
     () => getActiveSpawner(zoneBlockers, waveNumber, pathNodes),
     [zoneBlockers, waveNumber, pathNodes]
   )
-  // Where enemies emerge from on the path
-  const spawnerDist = spawnerInfo?.pathDist ?? 0
-  // Player stands on the transport side of the spawner (between ZB and transport)
+  const spawnerDist     = spawnerInfo?.pathDist ?? 0
   const playerAnchorDist = Math.min(pathLen - 10, spawnerDist + 40)
 
   // ── Reset ──────────────────────────────────────────────────────────────────
@@ -256,6 +262,12 @@ export default function SimulationPage() {
     const wave = data.waves[selectedWave]
     if (!wave) return
     const sq = data.squad
+    const startCurr = data.level.starting_currency || 0
+    currencyRef.current = startCurr
+    setPlayerCurrency(startCurr)
+    setPlayerBuilt({})
+    setSelectedSlotId(null)
+
     simRef.current = {
       time: 0,
       phase: 'waiting',
@@ -267,7 +279,9 @@ export default function SimulationPage() {
       transportHp: data.level.transport_hp,
       transportMaxHp: data.level.transport_hp,
       kills: 0,
-      towerCooldowns: Object.fromEntries(activeTowers.map(t => [t.id, Math.random() * FIRE_COOLDOWN])),
+      currency: startCurr,
+      activeTowers: [],   // starts empty — player builds
+      towerCooldowns: {},
       spawnerDist,
       playerDist: playerAnchorDist,
       playerAnchorDist,
@@ -280,12 +294,117 @@ export default function SimulationPage() {
     setStatElapsed(0)
     setStatPhase('waiting')
     setRaidWon(false)
-  }, [data, selectedWave, enemyMap, towers, spawnerDist, playerAnchorDist])
+  }, [data, selectedWave, enemyMap, spawnerDist, playerAnchorDist])
 
   useEffect(() => {
     resetSim()
     setRunning(false)
   }, [resetSim])
+
+  // ── Build / Upgrade / Sell ─────────────────────────────────────────────────
+  const handleBuild = useCallback((slotId, towerTypeId) => {
+    const tt = towerTypesMap[towerTypeId]
+    if (!tt) return
+    const cost = tt.base_cost
+    if (currencyRef.current < cost) return
+
+    currencyRef.current -= cost
+    setPlayerCurrency(Math.round(currencyRef.current))
+
+    // Update React state (triggers towers re-render)
+    setPlayerBuilt(prev => ({ ...prev, [slotId]: { towerTypeId, upgradeLevel: 0 } }))
+
+    // Also update running sim immediately
+    if (simRef.current) {
+      simRef.current.currency = currencyRef.current
+      const slot = towerSlots.find(s => s.id === slotId)
+      if (slot && slotUnlockWave(slot) < waveNumber) {
+        const availIds = new Set(towerSlots.filter(s => slotUnlockWave(s) < waveNumber).map(s => s.id))
+        const twObj = buildTowerObj(slot, tt, 0, waveNumber, availIds)
+        if (twObj.active) {
+          simRef.current.activeTowers = simRef.current.activeTowers.filter(t => t.slotId !== slotId)
+          simRef.current.activeTowers.push(twObj)
+          simRef.current.towerCooldowns[twObj.id] = FIRE_COOLDOWN * Math.random()
+          // float currency earn notification
+          simRef.current.damageNums.push({
+            x: slot.x, y: slot.y - 30,
+            val: `-${cost}💰`, life: 1.2, color: '#fbbf24', drift: 0,
+          })
+        }
+      }
+    }
+  }, [towerTypesMap, towerSlots, waveNumber])
+
+  const handleUpgrade = useCallback((slotId) => {
+    setPlayerBuilt(prev => {
+      const cur = prev[slotId]
+      if (!cur) return prev
+      const tt = towerTypesMap[cur.towerTypeId]
+      if (!tt || cur.upgradeLevel >= 3) return prev
+      const cost = towerUpgradeCost(tt, cur.upgradeLevel)
+      if (currencyRef.current < cost) return prev
+
+      currencyRef.current -= cost
+      setPlayerCurrency(Math.round(currencyRef.current))
+
+      const newLevel = cur.upgradeLevel + 1
+      const updated = { ...prev, [slotId]: { ...cur, upgradeLevel: newLevel } }
+
+      // Update running sim immediately
+      if (simRef.current) {
+        simRef.current.currency = currencyRef.current
+        const slot = towerSlots.find(s => s.id === slotId)
+        const availIds = new Set(towerSlots.filter(s => slotUnlockWave(s) < waveNumber).map(s => s.id))
+        if (slot) {
+          const twObj = buildTowerObj(slot, tt, newLevel, waveNumber, availIds)
+          simRef.current.activeTowers = simRef.current.activeTowers.filter(t => t.slotId !== slotId)
+          if (twObj.active) {
+            simRef.current.activeTowers.push(twObj)
+            simRef.current.towerCooldowns[twObj.id] = simRef.current.towerCooldowns[twObj.id] ?? FIRE_COOLDOWN
+          }
+          // float upgrade notification
+          simRef.current.damageNums.push({
+            x: slot.x, y: slot.y - 30,
+            val: `⬆ -${cost}💰`, life: 1.2, color: '#a78bfa', drift: 0,
+          })
+        }
+      }
+      return updated
+    })
+  }, [towerTypesMap, towerSlots, waveNumber])
+
+  const handleSell = useCallback((slotId) => {
+    const cur = playerBuilt[slotId]
+    if (!cur) return
+    const tt = towerTypesMap[cur.towerTypeId]
+    if (!tt) return
+    // Sell = 50% of build cost + 25% of upgrade costs spent
+    let sellVal = Math.round(tt.base_cost * 0.5)
+    for (let lv = 0; lv < cur.upgradeLevel; lv++) {
+      sellVal += Math.round(towerUpgradeCost(tt, lv) * 0.25)
+    }
+    currencyRef.current += sellVal
+    setPlayerCurrency(Math.round(currencyRef.current))
+
+    if (simRef.current) {
+      simRef.current.currency = currencyRef.current
+      simRef.current.activeTowers = simRef.current.activeTowers.filter(t => t.slotId !== slotId)
+      const slot = towerSlots.find(s => s.id === slotId)
+      if (slot) {
+        simRef.current.damageNums.push({
+          x: slot.x, y: slot.y - 30,
+          val: `+${sellVal}💰`, life: 1.2, color: '#22c55e', drift: 0,
+        })
+      }
+    }
+
+    setPlayerBuilt(prev => {
+      const next = { ...prev }
+      delete next[slotId]
+      return next
+    })
+    setSelectedSlotId(null)
+  }, [playerBuilt, towerTypesMap, towerSlots])
 
   // ── Simulation step ────────────────────────────────────────────────────────
   const step = useCallback((rawDt) => {
@@ -295,23 +414,22 @@ export default function SimulationPage() {
     const dt = Math.min(rawDt * speedRef.current, 0.15)
     sim.time += dt
 
-    // Spawn from queue
+    // Spawn
     while (sim.spawnIdx < sim.spawnQueue.length && sim.spawnQueue[sim.spawnIdx].time <= sim.time) {
       const ev = sim.spawnQueue[sim.spawnIdx++]
       const et = enemyMap[ev.typeId]
       if (et) {
-        // Enemies emerge from the active zone blocker position, slightly staggered
         const e = makeEnemy(et, sim.spawnerDist - 5 - (Math.random() * 8))
         sim.enemies.push(e)
       }
     }
 
-    // Decay visual effects
+    // Decay visuals
     sim.beams = sim.beams.filter(b => { b.life -= dt; return b.life > 0 })
     sim.damageNums = sim.damageNums.filter(d => {
       d.life -= dt
       d.y -= 28 * dt
-      d.x += d.drift * dt
+      d.x += (d.drift || 0) * dt
       return d.life > 0
     })
 
@@ -332,18 +450,14 @@ export default function SimulationPage() {
       }
     }
 
-    // Only enemies that have emerged from the spawner (past the ZB position)
     const aliveEnemies = sim.enemies.filter(e => e.alive && !e.dying && e.pathDist >= sim.spawnerDist - 5)
 
-    // Tower attacks: apply DPS + fire beams
-    for (const tower of activeTowers) {
-      sim.towerCooldowns[tower.id] -= dt
+    // Tower attacks — uses sim.activeTowers (mutable, updated by build actions)
+    for (const tower of sim.activeTowers) {
+      sim.towerCooldowns[tower.id] = (sim.towerCooldowns[tower.id] ?? 0) - dt
       if (sim.towerCooldowns[tower.id] > 0) continue
-
-      // Attack towers shoot; debuff towers apply slow; support towers boost (skip visual for now)
       if (tower.category === 'Support') continue
 
-      // Pick target: enemy furthest along path within range
       let target = null
       for (const e of aliveEnemies) {
         const pos = pointAtDist(Math.max(0, e.pathDist), pathNodes)
@@ -352,13 +466,11 @@ export default function SimulationPage() {
           if (!target || e.pathDist > target.pathDist) target = e
         }
       }
-
       if (!target) continue
 
       sim.towerCooldowns[tower.id] = FIRE_COOLDOWN
 
       if (tower.category === 'Debuff' && tower.effectType === 'Ice') {
-        // Apply slow
         target.slow = Math.max(0.1, 1 - tower.slowFactor)
         target.slowTimer = 2.0
         const pos = pointAtDist(Math.max(0, target.pathDist), pathNodes)
@@ -370,40 +482,32 @@ export default function SimulationPage() {
 
       const dmg = tower.dps * FIRE_COOLDOWN
       target.hp -= dmg
-
       const pos = pointAtDist(Math.max(0, target.pathDist), pathNodes)
       sim.beams.push({ fromX: tower.x, fromY: tower.y, toX: pos.x, toY: pos.y, color: tower.color, life: 0.18 })
       sim.damageNums.push({
         x: pos.x + (Math.random() - 0.5) * 14,
         y: pos.y - target.r - 2,
-        val: Math.round(dmg),
-        life: 0.65,
-        color: tower.color,
-        drift: (Math.random() - 0.5) * 20,
+        val: Math.round(dmg), life: 0.65,
+        color: tower.color, drift: (Math.random() - 0.5) * 20,
       })
 
       if (target.hp <= 0 && !target.dying) {
         target.dying = true
         target.dyingTimer = 0.35
         sim.kills++
-        // Kill burst
-        sim.damageNums.push({
-          x: pos.x, y: pos.y - target.r - 12,
-          val: '✕', life: 0.5, color: '#fbbf24', drift: 0,
-        })
+        sim.currency = (sim.currency || 0) + target.currencyDrop
+        sim.damageNums.push({ x: pos.x, y: pos.y - target.r - 12, val: `+${target.currencyDrop}💰`, life: 0.7, color: '#fbbf24', drift: 0 })
+        sim.damageNums.push({ x: pos.x, y: pos.y - target.r - 24, val: '✕', life: 0.5, color: '#fb923c', drift: 0 })
       }
     }
 
-    // Player + squad — anchored just past the active spawner (transport side of ZB)
-    // Player bobs slightly following the nearest enemy cluster, but stays near anchor
+    // Player + squad
     const sq = sim.squad
     if (aliveEnemies.length > 0) {
-      // Find enemy closest to spawner exit (just emerged from ZB)
       const nearSpawner = aliveEnemies.reduce((best, e) => {
         const d = Math.abs(e.pathDist - sim.spawnerDist)
         return d < best.d ? { e, d } : best
       }, { e: null, d: Infinity })
-      // Player moves gently toward anchor but slightly forward with the nearest enemy
       const targetDist = nearSpawner.e
         ? Math.min(sim.playerAnchorDist + 20, nearSpawner.e.pathDist + 15)
         : sim.playerAnchorDist
@@ -415,7 +519,6 @@ export default function SimulationPage() {
         const pPos = pointAtDist(Math.max(0, sim.playerDist), pathNodes)
         const pRange = sq.player_range ?? 80
 
-        // Player attack: nearest enemy in range
         let nearestE = null, nearestD = Infinity
         for (const e of aliveEnemies) {
           const ePos = pointAtDist(Math.max(0, e.pathDist), pathNodes)
@@ -428,10 +531,12 @@ export default function SimulationPage() {
           const ePos = pointAtDist(Math.max(0, nearestE.pathDist), pathNodes)
           sim.beams.push({ fromX: pPos.x, fromY: pPos.y, toX: ePos.x, toY: ePos.y, color: '#fbbf24', life: 0.14 })
           sim.damageNums.push({ x: ePos.x + 8, y: ePos.y - nearestE.r - 4, val: Math.round(pdmg), life: 0.6, color: '#fbbf24', drift: 8 })
-          if (nearestE.hp <= 0 && !nearestE.dying) { nearestE.dying = true; nearestE.dyingTimer = 0.35; sim.kills++ }
+          if (nearestE.hp <= 0 && !nearestE.dying) {
+            nearestE.dying = true; nearestE.dyingTimer = 0.35; sim.kills++
+            sim.currency = (sim.currency || 0) + nearestE.currencyDrop
+          }
         }
 
-        // Companions attack
         for (let ci = 0; ci < (sq.companion_count || 0); ci++) {
           const offset = sim.companionOffsets[ci] ?? (ci * 12 - 20)
           const cPos = pointAtDist(Math.max(0, sim.playerDist + offset), pathNodes)
@@ -446,42 +551,42 @@ export default function SimulationPage() {
             bestE.hp -= cdmg
             const ePos = pointAtDist(Math.max(0, bestE.pathDist), pathNodes)
             sim.beams.push({ fromX: cPos.x, fromY: cPos.y, toX: ePos.x, toY: ePos.y, color: '#86efac', life: 0.11 })
-            if (bestE.hp <= 0 && !bestE.dying) { bestE.dying = true; bestE.dyingTimer = 0.35; sim.kills++ }
+            if (bestE.hp <= 0 && !bestE.dying) {
+              bestE.dying = true; bestE.dyingTimer = 0.35; sim.kills++
+              sim.currency = (sim.currency || 0) + bestE.currencyDrop
+            }
           }
         }
       }
     }
 
-    // Phase logic
+    // Phase
     const allSpawned = sim.spawnIdx >= sim.spawnQueue.length
-    const anyAlive = aliveEnemies.length > 0 || sim.enemies.some(e => e.dying)
-    sim.phase = allSpawned && !anyAlive ? 'done' : sim.time < (data.waves[selectedWave]?.pre_wave_delay || 3) ? 'waiting' : 'active'
+    const anyAlive   = aliveEnemies.length > 0 || sim.enemies.some(e => e.dying)
+    sim.phase = allSpawned && !anyAlive ? 'done'
+      : sim.time < (data.waves[selectedWave]?.pre_wave_delay || 3) ? 'waiting'
+      : 'active'
 
-    // WIN condition: last wave completed AND this was the final zone blocker wave
-    // Final ZB = ZB with highest unlock_after_wave. After its wave clears → RAID WON.
-    const finalZbWave = zoneBlockers.length > 0
-      ? Math.max(...zoneBlockers.map(b => b.unlock_after_wave))
-      : null
-    const isLastWave = !data.waves[selectedWave + 1]
-    const isWinWave = finalZbWave !== null && waveNumber === finalZbWave
-    if (sim.phase === 'done' && (isWinWave || isLastWave)) {
-      setRaidWon(true)
-    }
+    // Sync currency to React state + ref
+    currencyRef.current = sim.currency || 0
+    setPlayerCurrency(Math.round(currencyRef.current))
+
+    // Win condition
+    const fbWave  = zoneBlockers.length > 0 ? Math.max(...zoneBlockers.map(b => b.unlock_after_wave)) : null
+    const isLastW = !data.waves[selectedWave + 1]
+    const isWinW  = fbWave !== null && waveNumber === fbWave
+    if (sim.phase === 'done' && (isWinW || isLastW)) setRaidWon(true)
 
     setStatTransportHp(Math.round(sim.transportHp))
     setStatKills(sim.kills)
     setStatElapsed(sim.time)
     setStatPhase(sim.phase)
     setTick(t => t + 1)
-  }, [data, enemyMap, pathNodes, pathLen, activeTowers, selectedWave])
+  }, [data, enemyMap, pathNodes, pathLen, selectedWave, zoneBlockers, waveNumber])
 
   // ── RAF loop ───────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!running) {
-      cancelAnimationFrame(rafRef.current)
-      lastTsRef.current = null
-      return
-    }
+    if (!running) { cancelAnimationFrame(rafRef.current); lastTsRef.current = null; return }
     const loop = (ts) => {
       if (lastTsRef.current === null) lastTsRef.current = ts
       const rawDt = (ts - lastTsRef.current) / 1000
@@ -512,20 +617,34 @@ export default function SimulationPage() {
 
   const sim = simRef.current
   const transportMaxHp = data.level.transport_hp
-  const tHpPct = statTransportHp !== null ? Math.max(0, statTransportHp / transportMaxHp) : 1
-  const pathPts = pathNodes.map(n => `${n.x},${n.y}`).join(' ')
-  const waveDelay = data.waves[selectedWave]?.pre_wave_delay || 3
-  const countdownSec = Math.max(0, waveDelay - statElapsed).toFixed(1)
+  const tHpPct         = statTransportHp !== null ? Math.max(0, statTransportHp / transportMaxHp) : 1
+  const pathPts        = pathNodes.map(n => `${n.x},${n.y}`).join(' ')
+  const waveDelay      = data.waves[selectedWave]?.pre_wave_delay || 3
+  const countdownSec   = Math.max(0, waveDelay - statElapsed).toFixed(1)
+  const spawnTotal     = sim?.spawnQueue?.length || 0
 
   const phaseConfig = {
-    idle:    { label: 'Ready to simulate', color: 'text-gray-500' },
+    idle:    { label: 'Ready', color: 'text-gray-500' },
     waiting: { label: `Wave in ${countdownSec}s`, color: 'text-yellow-400' },
     active:  { label: 'Wave active!', color: 'text-green-400' },
-    done:    { label: 'Wave complete!', color: 'text-orange-400' },
+    done:    { label: 'Wave done!', color: 'text-orange-400' },
   }
   const { label: phaseLabel, color: phaseColor } = phaseConfig[statPhase] || phaseConfig.idle
 
-  const spawnTotal = sim?.spawnQueue?.length || 0
+  // Selected slot info for build panel
+  const selSlot   = selectedSlotId ? towerSlots.find(s => s.id === selectedSlotId) : null
+  const selBuilt  = selectedSlotId ? playerBuilt[selectedSlotId] : null
+  const selTT     = selBuilt ? towerTypesMap[selBuilt.towerTypeId] : null
+  const slotUnlocked = selSlot ? (slotUnlockWave(selSlot) < waveNumber) : false
+
+  // Available tower types sorted by cost (for build panel)
+  const sortedTTs = data.tts ? [...data.tts].sort((a, b) => a.base_cost - b.base_cost) : []
+
+  // DPS mults helper for display
+  function ttDpsAtLevel(tt, lv) {
+    let m; try { m = JSON.parse(tt.upgrade_dps_mults) } catch { m = [1,1.6,2.5,4] }
+    return Math.round(tt.base_dps * (m[lv] ?? 1))
+  }
 
   return (
     <div className="flex flex-col h-full bg-[#0d1117]">
@@ -533,7 +652,6 @@ export default function SimulationPage() {
       {/* ── Top bar ─────────────────────────────────────────────────────── */}
       <div className="flex items-center gap-3 px-5 py-2.5 border-b border-gray-800/80 bg-[#161b22] flex-shrink-0 flex-wrap">
 
-        {/* Back */}
         <button onClick={() => navigate(`/level/${id}`)} className="text-gray-500 hover:text-gray-200 transition-colors flex-shrink-0">
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
@@ -555,15 +673,20 @@ export default function SimulationPage() {
               {w.wave_number}
             </button>
           ))}
-          {data.waves.length === 0 && <span className="text-xs text-gray-600">No waves</span>}
         </div>
 
         <div className="flex-1" />
 
-        {/* Transport HP bar */}
+        {/* 💰 Currency */}
+        <div className="flex items-center gap-1.5 px-3 py-1 bg-yellow-500/10 rounded-lg border border-yellow-500/25 flex-shrink-0">
+          <span className="text-sm">💰</span>
+          <span className="text-sm font-bold text-yellow-300 stat-num">{playerCurrency}</span>
+        </div>
+
+        {/* Transport HP */}
         <div className="flex items-center gap-2 flex-shrink-0">
-          <span className="text-xs text-gray-500">🚌 HP</span>
-          <div className="w-24 h-2 bg-gray-800 rounded-full overflow-hidden">
+          <span className="text-xs text-gray-500">🚌</span>
+          <div className="w-20 h-2 bg-gray-800 rounded-full overflow-hidden">
             <div className="h-full rounded-full transition-all duration-100"
               style={{ width: `${tHpPct * 100}%`, background: tHpPct > 0.5 ? '#22c55e' : tHpPct > 0.25 ? '#f59e0b' : '#ef4444' }} />
           </div>
@@ -583,7 +706,6 @@ export default function SimulationPage() {
           <span className="text-xs font-bold text-gray-300 stat-num">{statElapsed.toFixed(1)}s</span>
         </div>
 
-        {/* Phase */}
         <span className={`text-xs font-medium flex-shrink-0 ${phaseColor}`}>{phaseLabel}</span>
 
         {/* Speed */}
@@ -601,8 +723,7 @@ export default function SimulationPage() {
           <button
             onClick={() => {
               if (statPhase === 'done' || statPhase === 'idle') {
-                resetSim()
-                setTimeout(() => setRunning(true), 30)
+                resetSim(); setTimeout(() => setRunning(true), 30)
               } else {
                 setRunning(r => !r)
               }
@@ -615,7 +736,7 @@ export default function SimulationPage() {
           </button>
           <button onClick={() => { setRunning(false); resetSim() }}
             className="px-3 py-1.5 rounded-xl text-sm bg-gray-800 text-gray-400 hover:bg-gray-700 transition-colors border border-gray-700 flex-shrink-0"
-            title="Reset">
+            title="Full reset">
             ↺
           </button>
         </div>
@@ -626,8 +747,7 @@ export default function SimulationPage() {
 
         {/* SVG canvas */}
         <div className="bg-[#161b22] border border-gray-800/80 rounded-2xl overflow-hidden shadow-2xl flex-shrink-0">
-          <svg width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`}
-            style={{ display: 'block' }}>
+          <svg width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`} style={{ display: 'block' }}>
             <defs>
               <pattern id="sg" width="40" height="40" patternUnits="userSpaceOnUse">
                 <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1c2333" strokeWidth="0.6" />
@@ -646,93 +766,124 @@ export default function SimulationPage() {
             {/* Grid */}
             <rect width={SVG_W} height={SVG_H} fill="url(#sg)" />
 
-            {/* Path track */}
+            {/* Path */}
             {pathNodes.length >= 2 && (
               <>
                 <polyline points={pathPts} fill="none" stroke="#0f2744" strokeWidth={34} strokeLinejoin="round" strokeLinecap="round" />
                 <polyline points={pathPts} fill="none" stroke="#1e3a8a" strokeWidth={22} strokeLinejoin="round" strokeLinecap="round" opacity={0.5} />
                 <polyline points={pathPts} fill="none" stroke="#3b82f6" strokeWidth={8} strokeLinejoin="round" strokeLinecap="round" opacity={0.3} />
-                <polyline points={pathPts} fill="none" stroke="#60a5fa" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" opacity={0.6}
-                  strokeDasharray="14 7" />
+                <polyline points={pathPts} fill="none" stroke="#60a5fa" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" opacity={0.6} strokeDasharray="14 7" />
               </>
             )}
 
-            {/* Empty unlocked slots (no tower placed) */}
-            {allSlots.filter(s => !towers.find(t => t.slotId === s.id)).map(s => (
-              <g key={`es_${s.id}`} opacity={s.active ? 0.5 : 0.2}>
-                <circle cx={s.x} cy={s.y} r={18} fill="none" stroke="#4b5563" strokeWidth={1.5} strokeDasharray="4 3" />
-                <text x={s.x} y={s.y + 1} textAnchor="middle" dominantBaseline="middle" fontSize={10} fill="#6b7280">⬜</text>
-              </g>
-            ))}
+            {/* Clickable tower slots */}
+            {allSlots.map(s => {
+              const built = playerBuilt[s.id]
+              const isSelected = selectedSlotId === s.id
+              if (built) return null   // tower renders separately
+              return (
+                <g key={`slot_${s.id}`}
+                  opacity={s.active ? 1 : 0.3}
+                  style={{ cursor: s.active ? 'pointer' : 'default' }}
+                  onClick={() => s.active && setSelectedSlotId(isSelected ? null : s.id)}>
+                  {/* Selection highlight */}
+                  {isSelected && <circle cx={s.x} cy={s.y} r={28} fill="#fbbf2420" stroke="#fbbf24" strokeWidth={2} strokeDasharray="5 3" />}
+                  <circle cx={s.x} cy={s.y} r={20} fill={isSelected ? '#fbbf2415' : '#4b556320'}
+                    stroke={isSelected ? '#fbbf24' : s.active ? '#6b7280' : '#374151'}
+                    strokeWidth={1.5} strokeDasharray={s.active ? 'none' : '4 3'} />
+                  <text x={s.x} y={s.y + 1} textAnchor="middle" dominantBaseline="middle" fontSize={14} fill={s.active ? '#9ca3af' : '#4b5563'}>
+                    {s.active ? '+' : '🔒'}
+                  </text>
+                  {s.active && (
+                    <rect x={s.x - 18} y={s.y + 22} width={36} height={11} rx={3} fill="#0d1117cc" stroke="#fbbf2430" strokeWidth={1} />
+                  )}
+                  {s.active && (
+                    <text x={s.x} y={s.y + 28} textAnchor="middle" dominantBaseline="middle" fontSize={7} fill="#fbbf24">BUILD</text>
+                  )}
+                  {!s.active && (
+                    <text x={s.x} y={s.y + 28} textAnchor="middle" dominantBaseline="middle" fontSize={7} fill="#6b7280">W{slotUnlockWave(s)}</text>
+                  )}
+                </g>
+              )
+            })}
 
-            {/* Tower range halos — only active towers */}
+            {/* Tower range halos — active built towers */}
             {towers.filter(t => t.active).map(t => (
               <circle key={`rh_${t.id}`} cx={t.x} cy={t.y} r={t.range}
                 fill={`url(#rg_${t.id})`} stroke={t.color + '20'} strokeWidth={1} />
             ))}
 
-            {/* Towers — active in full color, locked as ghost */}
-            {towers.map(t => (
-              <g key={`tw_${t.id}`} opacity={t.active ? 1 : 0.25}>
-                {/* Lock badge for inactive towers */}
-                {!t.active && (
-                  <>
-                    <circle cx={t.x} cy={t.y} r={22} fill="none" stroke="#7f1d1d" strokeWidth={1.5} strokeDasharray="5 3" />
-                    <rect x={t.x - 18} y={t.y + 12} width={36} height={13} rx={4} fill="#1c1c2e" stroke="#7f1d1d" strokeWidth={1} />
-                    <text x={t.x} y={t.y + 20} textAnchor="middle" dominantBaseline="middle" fontSize={8} fill="#f87171">
-                      after W{t.unlockWave}🔒
-                    </text>
-                  </>
-                )}
-                <circle cx={t.x} cy={t.y} r={20} fill={t.color + (t.active ? '18' : '08')} stroke={t.color + (t.active ? '55' : '30')} strokeWidth={1.5} />
-                <circle cx={t.x} cy={t.y} r={11} fill={t.color + (t.active ? '45' : '20')} />
-                <circle cx={t.x} cy={t.y} r={7} fill={t.color + (t.active ? '80' : '40')} />
-                <text x={t.x} y={t.y + 1} textAnchor="middle" dominantBaseline="middle" fontSize={9} fill={t.active ? 'white' : '#6b7280'} fontWeight="bold" style={{ pointerEvents: 'none' }}>
-                  {t.name[0]}
-                </text>
-                <title>{t.name} · {t.dps.toFixed(0)} DPS · range {t.range}{!t.active ? ` · Unlocks after wave ${t.unlockWave}` : ''}</title>
-              </g>
-            ))}
+            {/* Built towers — clickable */}
+            {towers.map(t => {
+              const isSelected = selectedSlotId === t.slotId
+              const upgLv = t.upgradeLevel || 0
+              return (
+                <g key={`tw_${t.id}`} opacity={t.active ? 1 : 0.25}
+                  style={{ cursor: t.active ? 'pointer' : 'default' }}
+                  onClick={() => t.active && setSelectedSlotId(isSelected ? null : t.slotId)}>
+                  {/* Selection ring */}
+                  {isSelected && <circle cx={t.x} cy={t.y} r={28} fill="#a78bfa20" stroke="#a78bfa" strokeWidth={2} strokeDasharray="5 3" />}
+                  {/* Lock badge for wave-locked towers */}
+                  {!t.active && (
+                    <>
+                      <circle cx={t.x} cy={t.y} r={22} fill="none" stroke="#7f1d1d" strokeWidth={1.5} strokeDasharray="5 3" />
+                      <rect x={t.x - 18} y={t.y + 12} width={36} height={13} rx={4} fill="#1c1c2e" stroke="#7f1d1d" strokeWidth={1} />
+                      <text x={t.x} y={t.y + 20} textAnchor="middle" dominantBaseline="middle" fontSize={8} fill="#f87171">
+                        after W{t.unlockWave}🔒
+                      </text>
+                    </>
+                  )}
+                  <circle cx={t.x} cy={t.y} r={20} fill={t.color + (t.active ? '18' : '08')} stroke={t.color + (t.active ? '55' : '30')} strokeWidth={1.5} />
+                  <circle cx={t.x} cy={t.y} r={11} fill={t.color + (t.active ? '45' : '20')} />
+                  <circle cx={t.x} cy={t.y} r={7} fill={t.color + (t.active ? '80' : '40')} />
+                  <text x={t.x} y={t.y + 1} textAnchor="middle" dominantBaseline="middle" fontSize={9} fill={t.active ? 'white' : '#6b7280'} fontWeight="bold" style={{ pointerEvents: 'none' }}>
+                    {t.name[0]}
+                  </text>
+                  {/* Upgrade level dots */}
+                  {t.active && upgLv > 0 && (
+                    <g>
+                      {Array.from({length: upgLv}).map((_, di) => (
+                        <circle key={di} cx={t.x - 6 + di * 6} cy={t.y + 16} r={2.5} fill="#fbbf24" />
+                      ))}
+                    </g>
+                  )}
+                  <title>{t.name} Lv{upgLv} · {t.dps.toFixed(0)} DPS · range {t.range}</title>
+                </g>
+              )
+            })}
 
-            {/* Zone blockers — all locked ones for this wave */}
+            {/* Zone blockers */}
             {zoneBlockers.map((b, i) => {
               const pos = b.x !== undefined ? { x: b.x, y: b.y } : pathNodes[b.node_index]
               if (!pos) return null
               const locked = b.unlock_after_wave >= waveNumber
               if (!locked) return null
-              const isActiveSpawner = spawnerInfo?.blocker?.id === b.id ||
-                (spawnerInfo?.blocker === b)
+              const isActiveSpawner = spawnerInfo?.blocker?.id === b.id || spawnerInfo?.blocker === b
               const isFinal = finalZbWave !== null && b.unlock_after_wave === finalZbWave
-              // Colors: final = gold, active-spawn = red, locked = dark red
               const barFill   = isFinal ? '#78350f' : isActiveSpawner ? '#991b1b' : '#7f1d1d'
               const barStroke = isFinal ? '#fbbf24' : isActiveSpawner ? '#ef4444' : '#dc2626'
               const barSW     = isFinal ? 2.5 : isActiveSpawner ? 2 : 1.5
               const textFill  = isFinal ? '#fde68a' : '#fca5a5'
               return (
                 <g key={b.id || i}>
-                  {/* Glow ring */}
                   {(isActiveSpawner || isFinal) && (
                     <circle cx={pos.x} cy={pos.y} r={42}
                       fill={isFinal ? '#fbbf2410' : '#dc262618'}
                       stroke={isFinal ? '#fbbf2460' : '#dc262650'}
                       strokeWidth={isFinal ? 2.5 : 2} />
                   )}
-                  {/* Outer trophy ring for final */}
                   {isFinal && (
                     <circle cx={pos.x} cy={pos.y} r={52}
                       fill="none" stroke="#fbbf2430" strokeWidth={1.5} strokeDasharray="6 4" />
                   )}
-                  {/* Barrier bar */}
                   <rect x={pos.x - 32} y={pos.y - 10} width={64} height={20} rx={5}
-                    fill={barFill} fillOpacity={0.92}
-                    stroke={barStroke} strokeWidth={barSW} />
+                    fill={barFill} fillOpacity={0.92} stroke={barStroke} strokeWidth={barSW} />
                   <rect x={pos.x - 32} y={pos.y - 10} width={64} height={20} rx={5}
                     fill="url(#blocker_stripes)" fillOpacity={isFinal ? 0.15 : 0.3} />
                   <text x={pos.x} y={pos.y + 1} textAnchor="middle" dominantBaseline="middle"
                     fontSize={9} fontWeight="bold" fill={textFill}>
                     {isFinal ? '🏆 FINAL' : isActiveSpawner ? '👾 SPAWN' : `⛔ W${b.unlock_after_wave}`}
                   </text>
-                  {/* Label above */}
                   {(isActiveSpawner || isFinal) && (
                     <>
                       <rect x={pos.x - 34} y={pos.y - 30} width={68} height={16} rx={3}
@@ -747,7 +898,7 @@ export default function SimulationPage() {
               )
             })}
 
-            {/* Active spawn point indicator (when all ZBs open — spawn from path start) */}
+            {/* Spawn point when all ZBs open */}
             {!spawnerInfo && pathNodes.length >= 2 && (
               <g>
                 <circle cx={pathNodes[0].x} cy={pathNodes[0].y} r={16} fill="#dc262620" stroke="#ef4444" strokeWidth={2} />
@@ -755,7 +906,7 @@ export default function SimulationPage() {
               </g>
             )}
 
-            {/* Path end = Transport */}
+            {/* Transport */}
             {pathNodes.length >= 2 && (() => {
               const last = pathNodes[pathNodes.length - 1]
               return (
@@ -782,32 +933,16 @@ export default function SimulationPage() {
               const hpPct = Math.max(0, e.hp / e.maxHp)
               const alpha = e.dying ? Math.max(0, e.dyingTimer / 0.35) : 1
               const scale = e.dying ? (1 + (1 - alpha) * 0.5) : 1
-              const isSlowed = e.slowTimer > 0
-
               return (
                 <g key={e.id} opacity={alpha} transform={`translate(${pos.x},${pos.y})`}>
-                  {/* Slow ring */}
-                  {isSlowed && (
-                    <circle r={e.r + 5} fill="none" stroke="#38bdf8" strokeWidth={1.5} opacity={0.5}
-                      strokeDasharray="4 3" />
-                  )}
-                  {/* Death burst ring */}
-                  {e.dying && (
-                    <circle r={e.r * scale + 8} fill="none" stroke="#fbbf24" strokeWidth={2}
-                      opacity={alpha * 0.6} />
-                  )}
-                  {/* Body */}
-                  <circle r={e.r * scale}
-                    fill={e.color + 'dd'}
-                    stroke={e.color}
-                    strokeWidth={1.5}
-                  />
-                  {/* Enemy icon */}
-                  <text textAnchor="middle" dominantBaseline="middle" fontSize={e.size === 'Large' ? 12 : e.size === 'Small' ? 8 : 10}
+                  {e.slowTimer > 0 && <circle r={e.r + 5} fill="none" stroke="#38bdf8" strokeWidth={1.5} opacity={0.5} strokeDasharray="4 3" />}
+                  {e.dying && <circle r={e.r * scale + 8} fill="none" stroke="#fbbf24" strokeWidth={2} opacity={alpha * 0.6} />}
+                  <circle r={e.r * scale} fill={e.color + 'dd'} stroke={e.color} strokeWidth={1.5} />
+                  <text textAnchor="middle" dominantBaseline="middle"
+                    fontSize={e.size === 'Large' ? 12 : e.size === 'Small' ? 8 : 10}
                     fill="white" fontWeight="bold" style={{ pointerEvents: 'none' }}>
                     {e.size === 'Small' ? '◆' : e.size === 'Large' ? '▲' : '●'}
                   </text>
-                  {/* HP bar */}
                   {!e.dying && (
                     <>
                       <rect x={-e.r} y={-e.r - 8} width={e.r * 2} height={3} rx={1.5} fill="#1f2937" />
@@ -821,13 +956,12 @@ export default function SimulationPage() {
 
             {/* Player + companions */}
             {sim && pathNodes.length >= 2 && (() => {
-              const pd = Math.max(0, Math.min(sim.playerDist, pathLen - 0.5))
+              const pd   = Math.max(0, Math.min(sim.playerDist, pathLen - 0.5))
               const pPos = pointAtDist(pd, pathNodes)
               return (
                 <g>
-                  {/* Companions */}
                   {sim.companionOffsets.map((offset, ci) => {
-                    const cd = Math.max(0, Math.min(pd + offset, pathLen - 0.5))
+                    const cd   = Math.max(0, Math.min(pd + offset, pathLen - 0.5))
                     const cPos = pointAtDist(cd, pathNodes)
                     return (
                       <g key={ci} transform={`translate(${cPos.x},${cPos.y})`}>
@@ -836,7 +970,6 @@ export default function SimulationPage() {
                       </g>
                     )
                   })}
-                  {/* Player */}
                   <g transform={`translate(${pPos.x},${pPos.y})`}>
                     <circle r={13} fill="#78350f40" stroke="#fbbf24" strokeWidth={2} />
                     <circle r={8} fill="#fbbf24aa" />
@@ -846,119 +979,176 @@ export default function SimulationPage() {
               )
             })()}
 
-            {/* Damage numbers */}
+            {/* Damage / currency floats */}
             {sim?.damageNums.map((d, i) => (
               <text key={i} x={d.x} y={d.y} textAnchor="middle"
-                fontSize={typeof d.val === 'string' ? 14 : 12}
-                fontWeight="bold"
-                fill={d.color}
+                fontSize={typeof d.val === 'string' ? (d.val.includes('💰') ? 11 : 14) : 12}
+                fontWeight="bold" fill={d.color}
                 opacity={Math.min(1, d.life * 1.8)}
                 style={{ fontFamily: 'Space Grotesk, monospace', pointerEvents: 'none' }}>
                 {typeof d.val === 'string' ? d.val : `-${d.val}`}
               </text>
             ))}
 
-            {/* Pre-wave countdown overlay */}
+            {/* Countdown overlay */}
             {statPhase === 'waiting' && (
               <g>
                 <rect x={SVG_W / 2 - 90} y={SVG_H / 2 - 28} width={180} height={56} rx={12}
                   fill="#0d1117cc" stroke="#374151" strokeWidth={1} />
-                <text x={SVG_W / 2} y={SVG_H / 2 - 6} textAnchor="middle" fontSize={12} fill="#6b7280">
-                  Wave starts in
-                </text>
+                <text x={SVG_W / 2} y={SVG_H / 2 - 6} textAnchor="middle" fontSize={12} fill="#6b7280">Wave starts in</text>
                 <text x={SVG_W / 2} y={SVG_H / 2 + 16} textAnchor="middle" fontSize={22} fontWeight="bold" fill="#fbbf24"
-                  style={{ fontFamily: 'Space Grotesk, monospace' }}>
-                  {countdownSec}s
-                </text>
+                  style={{ fontFamily: 'Space Grotesk, monospace' }}>{countdownSec}s</text>
               </g>
             )}
 
-            {/* ── RAID CLEARED win overlay ─────────────────────────────────── */}
+            {/* Win overlay */}
             {raidWon && (
               <g>
-                {/* Dim backdrop */}
                 <rect width={SVG_W} height={SVG_H} fill="#000000aa" />
-                {/* Banner card */}
-                <rect x={SVG_W / 2 - 160} y={SVG_H / 2 - 70} width={320} height={140} rx={18}
-                  fill="#0d1117" stroke="#fbbf24" strokeWidth={2.5} />
-                {/* Gold top bar */}
-                <rect x={SVG_W / 2 - 160} y={SVG_H / 2 - 70} width={320} height={8} rx={4}
-                  fill="#fbbf24" />
-                {/* Trophy */}
-                <text x={SVG_W / 2} y={SVG_H / 2 - 28} textAnchor="middle" fontSize={40}
-                  style={{ fontFamily: 'system-ui' }}>🏆</text>
-                {/* RAID CLEARED */}
-                <text x={SVG_W / 2} y={SVG_H / 2 + 16} textAnchor="middle" fontSize={26} fontWeight="bold"
-                  fill="#fbbf24" style={{ fontFamily: 'Space Grotesk, monospace', letterSpacing: '0.08em' }}>
-                  RAID CLEARED
-                </text>
-                {/* Sub-line */}
+                <rect x={SVG_W / 2 - 160} y={SVG_H / 2 - 70} width={320} height={140} rx={18} fill="#0d1117" stroke="#fbbf24" strokeWidth={2.5} />
+                <rect x={SVG_W / 2 - 160} y={SVG_H / 2 - 70} width={320} height={8} rx={4} fill="#fbbf24" />
+                <text x={SVG_W / 2} y={SVG_H / 2 - 28} textAnchor="middle" fontSize={40} style={{ fontFamily: 'system-ui' }}>🏆</text>
+                <text x={SVG_W / 2} y={SVG_H / 2 + 16} textAnchor="middle" fontSize={26} fontWeight="bold" fill="#fbbf24"
+                  style={{ fontFamily: 'Space Grotesk, monospace', letterSpacing: '0.08em' }}>RAID CLEARED</text>
                 <text x={SVG_W / 2} y={SVG_H / 2 + 44} textAnchor="middle" fontSize={12} fill="#d97706"
-                  style={{ fontFamily: 'Space Grotesk, monospace' }}>
-                  Final zone blocker reached — victory!
-                </text>
+                  style={{ fontFamily: 'Space Grotesk, monospace' }}>Final zone blocker reached — victory!</text>
               </g>
             )}
           </svg>
         </div>
 
         {/* ── Sidebar ─────────────────────────────────────────────────────── */}
-        <div className="flex flex-col gap-3 w-44 flex-shrink-0">
+        <div className="flex flex-col gap-3 w-56 flex-shrink-0">
 
-          {/* Legend */}
-          <div className="bg-[#161b22] border border-gray-800/80 rounded-xl p-3">
-            <p className="text-[9px] text-gray-600 uppercase tracking-widest mb-2.5 font-bold">Legend</p>
-            <div className="space-y-1.5 text-[11px]">
-              {[
-                { icon: '●', color: 'text-yellow-400', label: 'Player' },
-                { icon: '★', color: 'text-green-400', label: 'Companion' },
-                { icon: '◆', color: 'text-blue-300', label: 'Scout (S)' },
-                { icon: '●', color: 'text-red-400', label: 'Grunt (M)' },
-                { icon: '▲', color: 'text-red-600', label: 'Brute (L)' },
-              ].map(({ icon, color, label }) => (
-                <div key={label} className="flex items-center gap-2">
-                  <span className={`${color} w-4 text-center`}>{icon}</span>
-                  <span className="text-gray-500">{label}</span>
-                </div>
-              ))}
-              <div className="border-t border-gray-800 pt-2 mt-2 space-y-1.5">
-                {[
-                  { color: '#f97316', label: 'Tower beam' },
-                  { color: '#fbbf24', label: 'Player atk' },
-                  { color: '#86efac', label: 'Squad atk' },
-                  { color: '#38bdf8', label: 'Ice slow' },
-                ].map(({ color, label }) => (
-                  <div key={label} className="flex items-center gap-2">
-                    <div className="w-5 h-0.5 rounded flex-shrink-0" style={{ background: color }} />
-                    <span className="text-gray-500">{label}</span>
-                  </div>
-                ))}
+          {/* ── Build / Upgrade panel ──────────────────────────────────────── */}
+          {selectedSlotId && (
+            <div className="bg-[#161b22] border border-gray-700/80 rounded-xl overflow-hidden">
+              {/* Header */}
+              <div className="flex items-center justify-between px-3 pt-3 pb-2 border-b border-gray-800">
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest font-bold">
+                  {selBuilt ? `Slot · ${selTT?.name || '?'} Lv${selBuilt.upgradeLevel}` : `Slot · Build Tower`}
+                </p>
+                <button onClick={() => setSelectedSlotId(null)} className="text-gray-600 hover:text-gray-400 text-xs">✕</button>
               </div>
-            </div>
-          </div>
 
-          {/* Towers */}
+              {!slotUnlocked ? (
+                <div className="px-3 py-3 text-center">
+                  <p className="text-xs text-gray-600">🔒 Unlocks after wave {selSlot ? slotUnlockWave(selSlot) : '?'}</p>
+                </div>
+              ) : selBuilt && selTT ? (
+                /* ── UPGRADE / SELL panel ─────────────────────────────────── */
+                <div className="px-3 py-3 space-y-3">
+                  {/* Current stats */}
+                  <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+                    <div className="bg-gray-900/60 rounded-lg p-2 text-center">
+                      <p className="text-gray-600 text-[9px]">DPS</p>
+                      <p className="text-orange-400 font-bold stat-num">{ttDpsAtLevel(selTT, selBuilt.upgradeLevel)}</p>
+                    </div>
+                    <div className="bg-gray-900/60 rounded-lg p-2 text-center">
+                      <p className="text-gray-600 text-[9px]">TYPE</p>
+                      <p className="font-bold" style={{ color: EFFECT_COLORS[selTT.effect_type] || '#9ca3af' }}>{selTT.effect_type}</p>
+                    </div>
+                  </div>
+                  {/* Level bar */}
+                  <div className="flex items-center gap-1.5">
+                    {[0,1,2,3].map(lv => (
+                      <div key={lv} className={`flex-1 h-1.5 rounded-full ${lv <= selBuilt.upgradeLevel ? 'bg-yellow-400' : 'bg-gray-700'}`} />
+                    ))}
+                    <span className="text-[10px] text-gray-500 ml-1">Lv{selBuilt.upgradeLevel}</span>
+                  </div>
+                  {/* Upgrade button */}
+                  {selBuilt.upgradeLevel < 3 ? (() => {
+                    const uCost = towerUpgradeCost(selTT, selBuilt.upgradeLevel)
+                    const canAff = playerCurrency >= uCost
+                    const nextDps = ttDpsAtLevel(selTT, selBuilt.upgradeLevel + 1)
+                    return (
+                      <button
+                        onClick={() => handleUpgrade(selectedSlotId)}
+                        disabled={!canAff}
+                        className={`w-full py-2 rounded-xl text-xs font-bold transition-all border ${
+                          canAff
+                            ? 'bg-purple-500/20 border-purple-500/40 text-purple-300 hover:bg-purple-500/30'
+                            : 'bg-gray-800/40 border-gray-700 text-gray-600 cursor-not-allowed'
+                        }`}>
+                        <span>⬆ Upgrade to Lv{selBuilt.upgradeLevel + 1}</span>
+                        <span className="ml-2 font-normal">{uCost}💰</span>
+                        <span className={`ml-2 text-[10px] ${canAff ? 'text-orange-400' : 'text-gray-600'}`}>→{nextDps} DPS</span>
+                      </button>
+                    )
+                  })() : (
+                    <div className="text-center text-[11px] text-yellow-400 font-bold py-1">✓ MAX LEVEL</div>
+                  )}
+                  {/* Sell button */}
+                  {(() => {
+                    let sv = Math.round(selTT.base_cost * 0.5)
+                    for (let lv = 0; lv < selBuilt.upgradeLevel; lv++) sv += Math.round(towerUpgradeCost(selTT, lv) * 0.25)
+                    return (
+                      <button onClick={() => handleSell(selectedSlotId)}
+                        className="w-full py-1.5 rounded-xl text-xs text-gray-500 border border-gray-800 hover:bg-red-900/20 hover:text-red-400 hover:border-red-800 transition-all">
+                        Sell +{sv}💰
+                      </button>
+                    )
+                  })()}
+                </div>
+              ) : (
+                /* ── BUILD panel — pick tower type ───────────────────────── */
+                <div className="py-1 max-h-72 overflow-y-auto">
+                  {sortedTTs.map(tt => {
+                    const canAff = playerCurrency >= tt.base_cost
+                    const isBuilt = Object.values(playerBuilt).some(b => b.towerTypeId === tt.id)
+                    return (
+                      <button key={tt.id}
+                        onClick={() => canAff && handleBuild(selectedSlotId, tt.id)}
+                        disabled={!canAff}
+                        className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-left transition-all border-b border-gray-800/60 last:border-0 ${
+                          canAff ? 'hover:bg-gray-800/60 cursor-pointer' : 'opacity-40 cursor-not-allowed'
+                        }`}>
+                        {/* Color dot */}
+                        <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: tt.color || '#f97316' }} />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-medium text-gray-200 truncate">{tt.name}</span>
+                            <span className={`text-[10px] font-bold ml-1 flex-shrink-0 ${canAff ? 'text-yellow-400' : 'text-gray-600'}`}>{tt.base_cost}💰</span>
+                          </div>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <span className="text-[9px] text-gray-600">{tt.base_dps} DPS</span>
+                            <span className="text-[9px] text-gray-700">·</span>
+                            <span className="text-[9px]" style={{ color: EFFECT_COLORS[tt.effect_type] || '#9ca3af' }}>{tt.effect_type}</span>
+                            {isBuilt && <span className="text-[9px] text-blue-500">• in use</span>}
+                          </div>
+                        </div>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Built towers summary */}
           <div className="bg-[#161b22] border border-gray-800/80 rounded-xl p-3">
             <p className="text-[9px] text-gray-600 uppercase tracking-widest mb-2.5 font-bold">
-              Towers <span className="text-gray-700 normal-case">({activeTowers.length}/{towers.length})</span>
+              Towers <span className="text-gray-700 normal-case">({Object.keys(playerBuilt).length}/{towerSlots.length})</span>
             </p>
-            {towers.length === 0
-              ? <p className="text-[11px] text-gray-600">No placements</p>
-              : (
-                <div className="space-y-1.5">
-                  {towers.map(t => (
-                    <div key={t.id} className={`flex items-center gap-2 ${t.active ? '' : 'opacity-40'}`}>
-                      <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: t.color }} />
-                      <span className="text-[11px] text-gray-400 truncate flex-1">{t.name}</span>
-                      {t.active
-                        ? <span className="text-[10px] text-gray-600 stat-num flex-shrink-0">{Math.round(t.dps)}</span>
-                        : <span className="text-[9px] text-red-500 flex-shrink-0">after W{t.unlockWave}🔒</span>
-                      }
-                    </div>
-                  ))}
-                </div>
-              )
-            }
+            {Object.keys(playerBuilt).length === 0 ? (
+              <p className="text-[11px] text-gray-600">Click a slot on the map to build</p>
+            ) : (
+              <div className="space-y-1.5">
+                {towers.map(t => (
+                  <button key={t.id} onClick={() => setSelectedSlotId(t.slotId === selectedSlotId ? null : t.slotId)}
+                    className={`w-full flex items-center gap-2 text-left rounded-lg px-1.5 py-1 transition-all ${
+                      selectedSlotId === t.slotId ? 'bg-purple-500/15 border border-purple-500/25' : 'hover:bg-gray-800/40 border border-transparent'
+                    } ${!t.active ? 'opacity-40' : ''}`}>
+                    <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: t.color }} />
+                    <span className="text-[11px] text-gray-300 truncate flex-1">{t.name}</span>
+                    {t.upgradeLevel > 0 && (
+                      <span className="text-[9px] text-yellow-500 flex-shrink-0">Lv{t.upgradeLevel}</span>
+                    )}
+                    <span className="text-[10px] text-gray-600 stat-num flex-shrink-0">{Math.round(t.dps)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Squad stats */}
@@ -969,10 +1159,6 @@ export default function SimulationPage() {
                 <div className="flex justify-between">
                   <span className="text-gray-600">Player DPS</span>
                   <span className="text-yellow-400 stat-num">{data.squad.player_dps}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Range</span>
-                  <span className="text-blue-400 stat-num">{data.squad.player_range}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-600">Companions</span>
@@ -986,7 +1172,7 @@ export default function SimulationPage() {
             </div>
           )}
 
-          {/* Wave summary */}
+          {/* Wave info */}
           {data.waves[selectedWave] && (
             <div className="bg-[#161b22] border border-gray-800/80 rounded-xl p-3">
               <p className="text-[9px] text-gray-600 uppercase tracking-widest mb-2 font-bold">
@@ -994,30 +1180,18 @@ export default function SimulationPage() {
               </p>
               <div className="space-y-1 text-[11px]">
                 <div className="flex justify-between">
-                  <span className="text-gray-600">👾 Spawn from</span>
-                  <span className="text-red-400 stat-num">
-                    {spawnerInfo ? `ZB W${spawnerInfo.blocker.unlock_after_wave}` : 'Path start'}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Spawn dist</span>
-                  <span className="text-gray-500 stat-num">{Math.round(spawnerDist)}u</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Active towers</span>
-                  <span className="text-green-400 stat-num">{activeTowers.length}</span>
-                </div>
-                <div className="flex justify-between">
                   <span className="text-gray-600">Enemies</span>
                   <span className="text-gray-300 stat-num">{spawnTotal}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-600">Pre-delay</span>
-                  <span className="text-gray-300 stat-num">{waveDelay}s</span>
-                </div>
-                <div className="flex justify-between">
                   <span className="text-gray-600">Killed</span>
                   <span className="text-orange-400 stat-num">{statKills}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Spawn</span>
+                  <span className="text-red-400 stat-num text-[10px]">
+                    {spawnerInfo ? `ZB W${spawnerInfo.blocker.unlock_after_wave}` : 'Start'}
+                  </span>
                 </div>
               </div>
               {spawnTotal > 0 && (
@@ -1032,7 +1206,7 @@ export default function SimulationPage() {
             </div>
           )}
 
-          {/* Zone blockers status */}
+          {/* Zone blockers */}
           {zoneBlockers.length > 0 && (
             <div className={`bg-[#161b22] border rounded-xl p-3 ${raidWon ? 'border-yellow-500/60' : 'border-gray-800/80'}`}>
               <p className="text-[9px] text-gray-600 uppercase tracking-widest mb-2 font-bold">
@@ -1040,15 +1214,12 @@ export default function SimulationPage() {
               </p>
               <div className="space-y-1.5">
                 {zoneBlockers.map((b, i) => {
-                  const locked = b.unlock_after_wave >= waveNumber
+                  const locked  = b.unlock_after_wave >= waveNumber
                   const isFinal = finalZbWave !== null && b.unlock_after_wave === finalZbWave
                   return (
                     <div key={b.id || i} className={`flex items-center gap-2 text-[11px] ${locked ? '' : 'opacity-40'}`}>
                       <span>{isFinal ? '🏆' : locked ? '⛔' : '✅'}</span>
-                      <span className={
-                        isFinal && locked ? 'text-yellow-400 font-bold' :
-                        locked ? 'text-red-400' : 'text-green-600 line-through'
-                      }>
+                      <span className={isFinal && locked ? 'text-yellow-400 font-bold' : locked ? 'text-red-400' : 'text-green-600 line-through'}>
                         {isFinal ? 'WIN · W' : 'Clears W'}{b.unlock_after_wave}
                       </span>
                     </div>
